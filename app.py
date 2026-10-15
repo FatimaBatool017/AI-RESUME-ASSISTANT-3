@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -27,6 +28,9 @@ from pypdf import PdfReader
 # Models are tried in order; the first one that exists for your API key is used.
 # Override the first choice with GEMINI_MODEL (env var or Streamlit secret).
 DEFAULT_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
+
+RETRIES_PER_MODEL = 3      # attempts per model before moving to the next one
+RETRY_BASE_DELAY = 2       # seconds; doubles each retry (2s, 4s)
 
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 15_000
@@ -265,8 +269,24 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def _is_unavailable(message: str) -> bool:
+    """Model doesn't exist / isn't supported for this key: skip straight to the next model."""
+    return any(s in message for s in ("404", "not found", "not supported", "no longer available"))
+
+
+def _is_overloaded(message: str) -> bool:
+    """Temporary server-side problems: worth retrying, then trying another model."""
+    return any(s in message for s in (
+        "503", "unavailable", "overloaded", "high demand", "500", "internal", "504", "deadline", "429", "resource_exhausted",
+    ))
+
+
 def analyze_resume(api_key: str, resume_text: str, job_description: str):
-    """Call Gemini and return (normalized_result, model_used)."""
+    """Call Gemini and return (normalized_result, model_used).
+
+    Retries temporary errors (503/429/500) with exponential backoff, then falls
+    back to the next model in the list.
+    """
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(resume_text[:MAX_RESUME_CHARS], job_description[:MAX_JD_CHARS])
 
@@ -275,25 +295,30 @@ def analyze_resume(api_key: str, resume_text: str, job_description: str):
 
     last_error = None
     for model in models:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                ),
-            )
-            raw = response.text
-            if not raw:
-                raise ValueError("The AI returned an empty response. Please try again.")
-            return normalize_result(parse_json_response(raw)), model
-        except Exception as exc:  # try the next model only if this one is unavailable
-            last_error = exc
-            message = str(exc).lower()
-            if any(s in message for s in ("404", "not found", "not supported", "no longer available")):
-                continue
-            raise
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw = response.text
+                if not raw:
+                    raise ValueError("The AI returned an empty response. Please try again.")
+                return normalize_result(parse_json_response(raw)), model
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if _is_unavailable(message):
+                    break  # this model isn't usable; try the next one
+                if _is_overloaded(message):
+                    if attempt < RETRIES_PER_MODEL - 1:
+                        time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                    continue  # retry same model, then fall through to the next
+                raise  # real errors (bad API key, bad request, ...) are shown immediately
     raise last_error
 
 
@@ -430,7 +455,13 @@ def main():
         with st.spinner("Analyzing your resume..."):
             result, model = analyze_resume(api_key, text, job_description)
     except Exception as exc:
-        st.error(f"AI analysis failed: {exc}")
+        if _is_overloaded(str(exc).lower()):
+            st.error(
+                "Google's Gemini servers are overloaded right now (this is temporary and not a problem "
+                "with your resume or API key). Please wait a minute and click Analyze again."
+            )
+        else:
+            st.error(f"AI analysis failed: {exc}")
         return
 
     render_results(result, run_basic_checks(text), model)
